@@ -1,0 +1,24 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller 中间产物 / 打包输出（项目自带的 .spec / build.bat 需要提交）
+build/
+dist/
+*.exe
+
+# 私有工作笔记（不属于项目源码）
+.workbuddy/
+
+# 临时文件
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
