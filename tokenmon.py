@@ -43,6 +43,8 @@ try:
 except ImportError:          # 非 Windows 平台仅退化为日志模式
     winreg = None
 
+IS_MAC = sys.platform == "darwin"
+
 APP_NAME = "小天tokens监控"
 OFFICIAL_SITE = "https://aicgxt.com"
 OFFICIAL_CHAT_URL = "https://aicgxt.com/chat"
@@ -104,7 +106,12 @@ APP_ICON_B64 = (
     "dwiidy5ooMp+8lXa5KwQ86A7o/X/e6+6VJRR7jdbvCBBaKONNtpoo4022mijjTbaaKONncZ/A2PbeY2VVI2eAAAAAElFTkSu"
     "QmCC"
 )
-APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "TokenMon")
+if IS_MAC:
+    APP_DIR = os.path.join(os.path.expanduser("~"),
+                           "Library", "Application Support", "TokenMon")
+else:
+    APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA",
+                                          os.path.expanduser("~")), "TokenMon")
 STATE_FILE = os.path.join(APP_DIR, "state.json")
 LOG_FILE = os.path.join(APP_DIR, "records.jsonl")   # 每次请求的明细日志
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
@@ -115,9 +122,11 @@ PROXY_HOST = "127.0.0.1"
 CA_DIR = os.path.join(APP_DIR, "ca")
 CA_CERT_FILE = os.path.join(CA_DIR, "tokenmon-ca.pem")
 CA_KEY_FILE = os.path.join(CA_DIR, "tokenmon-ca.key")
+CA_COMMON_NAME = "TokenMon Local Root CA"
 LEAF_DIR = os.path.join(CA_DIR, "leaf")
 PROXY_BACKUP_FILE = os.path.join(APP_DIR, "proxy_backup.json")
 RESTORE_BAT = os.path.join(APP_DIR, "restore_system_proxy.bat")
+RESTORE_SH = os.path.join(APP_DIR, "restore_system_proxy.command")
 SNIFF_MAX_BYTES = 32 * 1024 * 1024   # 单个响应最多缓存多少字节用于解析 usage
 RELAY_CHUNK = 65536
 
@@ -1181,14 +1190,13 @@ _ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 
 
 class Autostart:
-    """开机自启：往 HKCU\\...\\Run 里注册一条，注销即删除。
-
-    只写当前用户，不需要管理员权限；卸载时（或取消勾选）整条删掉，
-    不留残值。脚本运行时注册的是 pythonw + 脚本路径，打包后是 exe 本身。
-    """
+    """开机自启：Windows 写 HKCU\\...\\Run；macOS 写 LaunchAgents plist。"""
 
     KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
     NAME = "TokenMon"
+    LAUNCH_AGENT = os.path.join(os.path.expanduser("~"),
+                                "Library", "LaunchAgents",
+                                "com.tokenmon.plist")
 
     @staticmethod
     def cmd():
@@ -1200,7 +1208,25 @@ class Autostart:
         return '"%s" "%s"' % (pyw, os.path.abspath(__file__))
 
     @staticmethod
+    def _mac_write_plist():
+        import plistlib
+        if getattr(sys, "frozen", False):
+            args = [sys.executable]
+        else:
+            args = [sys.executable, os.path.abspath(__file__)]
+        pl = {"Label": "com.tokenmon",
+              "ProgramArguments": args,
+              "RunAtLoad": True,
+              "LimitLoadToSessionType": "Aqua",
+              "ProcessType": "Interactive"}
+        os.makedirs(os.path.dirname(Autostart.LAUNCH_AGENT), exist_ok=True)
+        with open(Autostart.LAUNCH_AGENT, "wb") as f:
+            plistlib.dump(pl, f)
+
+    @staticmethod
     def enabled():
+        if IS_MAC:
+            return os.path.exists(Autostart.LAUNCH_AGENT)
         if winreg is None:
             return False
         try:
@@ -1212,8 +1238,24 @@ class Autostart:
 
     @staticmethod
     def set_on(on):
+        if IS_MAC:
+            try:
+                if on:
+                    Autostart._mac_write_plist()
+                    subprocess.run(["launchctl", "load",
+                                    Autostart.LAUNCH_AGENT], capture_output=True)
+                else:
+                    subprocess.run(["launchctl", "unload",
+                                    Autostart.LAUNCH_AGENT], capture_output=True)
+                    try:
+                        os.remove(Autostart.LAUNCH_AGENT)
+                    except OSError:
+                        pass
+                return True, ("已设置开机自启" if on else "已取消开机自启")
+            except OSError as e:
+                return False, f"写入 LaunchAgent 失败: {e}"
         if winreg is None:
-            return False, "仅 Windows 支持开机自启"
+            return False, "仅 Windows / macOS 支持开机自启"
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, Autostart.KEY, 0,
                                 winreg.KEY_READ | winreg.KEY_WRITE) as k:
@@ -1231,7 +1273,10 @@ class Autostart:
 
 
 class SystemProxy:
-    """通过注册表接管 Windows 系统代理 / 用户环境变量，并可完整还原。"""
+    """接管系统代理 / 环境变量并可完整还原。
+
+    Windows：写注册表 Internet Settings；macOS：用 networksetup 逐服务设置，
+    通过 osascript 提权（GUI 会弹一次管理员授权框）。"""
 
     KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
@@ -1240,9 +1285,66 @@ class SystemProxy:
         return winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
                               winreg.KEY_READ | (winreg.KEY_WRITE if write else 0))
 
+    # ---- macOS 系统代理（networksetup 逐网络服务）
+    @staticmethod
+    def _mac_services():
+        try:
+            out = subprocess.run(["networksetup", "-listallnetworkservices"],
+                                 capture_output=True, text=True).stdout
+        except OSError:
+            return []
+        services = []
+        for line in out.splitlines()[1:]:      # 首行是说明文字
+            line = line.strip()
+            if line and not line.startswith("*"):   # * 表示服务已禁用
+                services.append(line)
+        return services
+
+    @staticmethod
+    def _mac_sudo(shell_cmd):
+        """AppleScript 提权执行；一次调用把多条命令合并，只弹一次授权框。"""
+        script = 'do shell script "%s" with administrator privileges' % \
+                 shell_cmd.replace('\\', '\\\\').replace('"', '\\"')
+        r = subprocess.run(["osascript", "-e", script], capture_output=True)
+        return r.returncode == 0
+
+    @staticmethod
+    def _mac_get(service):
+        d = {"enabled": False, "server": "", "port": 0}
+        try:
+            out = subprocess.run(["networksetup", "-getwebproxy", service],
+                                 capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                if line.startswith("Enabled:"):
+                    d["enabled"] = "Yes" in line
+                elif line.startswith("Server:"):
+                    d["server"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Port:"):
+                    try:
+                        d["port"] = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        return d
+
     # ---- 系统代理（Chrome / Edge / Electron 类程序都读这里）
     @staticmethod
     def read():
+        if IS_MAC:
+            services = {s: SystemProxy._mac_get(s)
+                        for s in SystemProxy._mac_services()}
+            # 兼容状态栏读取：任一服务启用 web 代理即视为"已开启"
+            enabled = 0
+            server = ""
+            for cfg in services.values():
+                if cfg.get("enabled"):
+                    enabled = 1
+                    server = f"{cfg.get('server')}:{cfg.get('port')}"
+                    break
+            return {"_mac": True, "services": services,
+                    "ProxyEnable": enabled, "ProxyServer": server,
+                    "ProxyOverride": None, "AutoConfigURL": None}
         out = {}
         if winreg is None:
             return out
@@ -1260,6 +1362,17 @@ class SystemProxy:
 
     @staticmethod
     def apply(server):
+        if IS_MAC:
+            prev = SystemProxy.read()
+            host, _, port = server.rpartition(":")
+            cmds = []
+            for svc in SystemProxy._mac_services():
+                cmds.append("networksetup -setwebproxy '%s' %s %s"
+                            % (svc, host, port))
+                cmds.append("networksetup -setsecurewebproxy '%s' %s %s"
+                            % (svc, host, port))
+            SystemProxy._mac_sudo(" && ".join(cmds))
+            return prev
         prev = SystemProxy.read()
         with SystemProxy._key(SystemProxy.KEY, True) as k:
             winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
@@ -1277,7 +1390,24 @@ class SystemProxy:
 
     @staticmethod
     def restore(prev):
-        if winreg is None or not prev:
+        if not prev:
+            return
+        if IS_MAC and prev.get("_mac"):
+            cmds = []
+            for svc, cfg in prev.get("services", {}).items():
+                if cfg.get("enabled") and cfg.get("server"):
+                    cmds.append("networksetup -setwebproxy '%s' %s %s"
+                                % (svc, cfg["server"], cfg["port"]))
+                    cmds.append("networksetup -setsecurewebproxy '%s' %s %s"
+                                % (svc, cfg["server"], cfg["port"]))
+                else:
+                    cmds.append("networksetup -setwebproxystate '%s' off" % svc)
+                    cmds.append("networksetup -setsecurewebproxystate '%s' off"
+                                % svc)
+            if cmds:
+                SystemProxy._mac_sudo(" && ".join(cmds))
+            return
+        if winreg is None:
             return
         try:
             with SystemProxy._key(SystemProxy.KEY, True) as k:
@@ -1297,6 +1427,8 @@ class SystemProxy:
 
     @staticmethod
     def refresh():
+        if IS_MAC:
+            return
         try:
             import ctypes
             for opt in (39, 37):     # SETTINGS_CHANGED / REFRESH
@@ -1307,6 +1439,8 @@ class SystemProxy:
     # ---- 用户环境变量（Node / Python / Rust 等命令行程序靠这个走代理）
     @staticmethod
     def read_env():
+        if IS_MAC:
+            return {}
         out = {}
         if winreg is None:
             return out
@@ -1323,6 +1457,8 @@ class SystemProxy:
 
     @staticmethod
     def apply_env(pairs):
+        if IS_MAC:
+            return {}          # macOS 系统代理已覆盖 GUI，环境变量对已运行进程无效
         prev = SystemProxy.read_env()
         with SystemProxy._key("Environment", True) as k:
             for n, v in pairs.items():
@@ -1332,7 +1468,9 @@ class SystemProxy:
 
     @staticmethod
     def restore_env(prev):
-        if winreg is None or not prev:
+        if IS_MAC or not prev:
+            return
+        if winreg is None:
             return
         try:
             with SystemProxy._key("Environment", True) as k:
@@ -1350,6 +1488,8 @@ class SystemProxy:
 
     @staticmethod
     def _broadcast():
+        if IS_MAC:
+            return
         try:
             import ctypes
             res = ctypes.c_long()
@@ -1386,23 +1526,49 @@ def clear_proxy_backup():
 
 
 def write_restore_bat():
-    """生成一键还原脚本：程序异常退出导致上不了网时双击即可修复。"""
-    body = (
-        "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
-        "echo Restoring system proxy settings...\r\n"
-        "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\"
-        "Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f >nul\r\n"
-        "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\"
-        "Internet Settings\" /v ProxyServer /f >nul 2>nul\r\n"
-        "for %%V in (HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy "
-        "NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY) do "
-        "reg delete \"HKCU\\Environment\" /v %%V /f >nul 2>nul\r\n"
-        "echo Done.  System proxy disabled, proxy env vars removed.\r\n"
-        "pause\r\n"
-    )
+    """生成一键还原脚本：程序异常退出导致上不了网时双击即可修复。
+
+    Windows 生成 .bat；macOS 生成 .command（双击在终端运行，AppleScript 提权）。"""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
+        if IS_MAC:
+            body = (
+                "#!/bin/bash\n"
+                "echo '还原系统代理（会弹管理员密码框）...'\n"
+                "osascript <<'APPLESCRIPT'\n"
+                "set svcs to do shell script "
+                "\"networksetup -listallnetworkservices\"\n"
+                "set theCmd to \"\"\n"
+                "repeat with s in paragraphs 2 thru -1 of svcs\n"
+                "    if s is not \"\" and s does not start with \"*\" then\n"
+                "        set q to quoted form of s\n"
+                "        set theCmd to theCmd & \"networksetup -setwebproxystate \" "
+                "& q & \" off 2>/dev/null; networksetup -setsecurewebproxystate \" "
+                "& q & \" off 2>/dev/null; \"\n"
+                "    end if\n"
+                "end repeat\n"
+                "do shell script theCmd with administrator privileges\n"
+                "APPLESCRIPT\n"
+                "echo '完成。系统代理已还原。'\n"
+            )
+            with open(RESTORE_SH, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.chmod(RESTORE_SH, 0o755)
+            return
+        body = (
+            "@echo off\r\n"
+            "chcp 65001 >nul\r\n"
+            "echo Restoring system proxy settings...\r\n"
+            "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\"
+            "Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f >nul\r\n"
+            "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\"
+            "Internet Settings\" /v ProxyServer /f >nul 2>nul\r\n"
+            "for %%V in (HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy "
+            "NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY) do "
+            "reg delete \"HKCU\\Environment\" /v %%V /f >nul 2>nul\r\n"
+            "echo Done.  System proxy disabled, proxy env vars removed.\r\n"
+            "pause\r\n"
+        )
         with open(RESTORE_BAT, "w", encoding="ascii", newline="") as f:
             f.write(body)
     except OSError:
@@ -1467,7 +1633,7 @@ class CertAuthority:
             self._ca_key = rsa.generate_private_key(public_exponent=65537,
                                                     key_size=2048)
             name = x509.Name([
-                x509.NameAttribute(NameOID.COMMON_NAME, "TokenMon Local Root CA"),
+                x509.NameAttribute(NameOID.COMMON_NAME, CA_COMMON_NAME),
                 x509.NameAttribute(NameOID.ORGANIZATION_NAME, "TokenMon"),
             ])
             now = datetime.now()
@@ -1641,7 +1807,18 @@ class CertAuthority:
         return self._ca_cert.public_bytes(self._mod[2].Encoding.DER)
 
     def is_installed(self):
-        if not self._ca_cert or os.name != "nt":
+        if not self._ca_cert:
+            return False
+        if IS_MAC:
+            try:
+                r = subprocess.run(
+                    ["security", "find-certificate", "-c", CA_COMMON_NAME,
+                     os.path.expanduser("~/Library/Keychains/login.keychain-db")],
+                    capture_output=True)
+                return r.returncode == 0
+            except OSError:
+                return False
+        if os.name != "nt":
             return False
         try:
             rc, _ = self._certutil("-user", "-verifystore", "Root",
@@ -1653,6 +1830,19 @@ class CertAuthority:
     def install(self):
         if self._ca_cert is None:
             return False, "根证书尚未生成"
+        if IS_MAC:
+            try:
+                r = subprocess.run(
+                    ["security", "add-trusted-cert", "-r", "trustRoot",
+                     "-k", os.path.expanduser(
+                         "~/Library/Keychains/login.keychain-db"),
+                     self.cert_path], capture_output=True)
+                if r.returncode == 0:
+                    return True, ""
+                return False, ("未信任根证书 —— 请在『钥匙串访问』中找到 "
+                               "TokenMon Local Root CA 并设为『始终信任』")
+            except OSError as e:
+                return False, f"调用 security 失败: {e}"
         note = ""
         if os.name == "nt":
             try:
@@ -1677,6 +1867,16 @@ class CertAuthority:
     def uninstall(self):
         if not self.thumbprint:
             return False, "根证书尚未生成"
+        if IS_MAC:
+            try:
+                r = subprocess.run(
+                    ["security", "delete-certificate", "-c", CA_COMMON_NAME,
+                     os.path.expanduser("~/Library/Keychains/login.keychain-db")],
+                    capture_output=True)
+                return r.returncode == 0, ("" if r.returncode == 0
+                                           else "删除证书失败")
+            except OSError as e:
+                return False, f"调用 security 失败: {e}"
         if os.name == "nt":
             try:
                 ok, note = self._win_store(self._der(), remove=True)
@@ -4108,14 +4308,14 @@ class App(tk.Tk):
             write_restore_bat()
 
     def apply_system_proxy(self):
-        if winreg is None:
-            return False, "仅 Windows 支持系统代理接管"
+        if winreg is None and not IS_MAC:
+            return False, "仅 Windows / macOS 支持系统代理接管"
         self._ensure_backup()
         SystemProxy.apply(f"{PROXY_HOST}:{self._proxy_port}")
         return True, f"系统代理已指向 {PROXY_HOST}:{self._proxy_port}"
 
     def apply_env_proxy(self):
-        if winreg is None:
+        if winreg is None and not IS_MAC:
             return False, "仅 Windows 支持环境变量注入"
         self._ensure_backup()
         prefix = f"http://{PROXY_HOST}:{self._proxy_port}"
@@ -4522,7 +4722,7 @@ class App(tk.Tk):
         else:
             lbl["ca"].configure(text="○ 未生成", fg=DIM)
 
-        cur = SystemProxy.read() if winreg is not None else {}
+        cur = SystemProxy.read() if (winreg is not None or IS_MAC) else {}
         server = str(cur.get("ProxyServer") or "")
         if cur.get("ProxyEnable") and str(self._proxy_port) in server:
             lbl["sys"].configure(text=f"● 已接管 → {server}", fg=ACCENT)
@@ -4530,7 +4730,7 @@ class App(tk.Tk):
             lbl["sys"].configure(text=f"○ 已开启（别的程序设的 {server}）", fg=DIM)
         else:
             lbl["sys"].configure(text="○ 未开启", fg=DIM)
-        envd = SystemProxy.read_env() if winreg is not None else {}
+        envd = SystemProxy.read_env() if (winreg is not None or IS_MAC) else {}
         hp = str(envd.get("HTTPS_PROXY") or "")
         if hp:
             lbl["env"].configure(

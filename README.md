@@ -5,7 +5,7 @@
 <h1 align="center">小天 tokens 监控</h1>
 
 <p align="center">
-  一个 Windows 桌面小工具 —— <b>直接抓本机所有 AI 调用的 token 用量</b>，实时显示生成速度，按模型 / 厂商统计。<br>
+  一个 Windows / macOS 桌面小工具 —— <b>直接抓本机所有 AI 调用的 token 用量</b>，实时显示生成速度，按模型 / 厂商统计。<br>
   暗色 HUD 界面、跳动曲线，双击即用。
 </p>
 
@@ -43,8 +43,8 @@
 
 ### 直接使用（推荐）
 
-1. 在 [Releases](../../releases) 下载 `小天tokens监控.exe`
-2. 双击运行
+- **Windows**：在 [Releases](../../releases) 下载 `小天tokens监控.exe`，双击运行
+- **macOS**：在 [Releases](../../releases) 下载 `小天tokens监控.app`，双击运行（首次开启网络直采时会要求输入管理员密码 + 信任根证书）
 
 ### 命令行
 
@@ -62,10 +62,23 @@
 ```bash
 pip install pyinstaller cryptography
 python tokenmon.py            # 直接运行
-build.bat                     # 打包为单文件 exe
+build.bat                     # Windows：打包为单文件 exe
+./build_mac.sh                # macOS：打包为 .app
 ```
 
 需要 Python 3.10+（本项目在 3.14 验证）。
+
+### macOS 版说明
+
+macOS 版与 Windows 版功能一致，系统代理接管、根证书信任、开机自启分别用
+`networksetup`、`security`、`launchd` 实现：
+
+- **首次开启网络直采**：会弹出管理员密码框（用于设置系统代理），并提示信任本地根证书
+  `TokenMon Local Root CA`（用于解密 HTTPS 流量）。两者都只在首次出现一次。
+- **退出自动还原**：关闭程序时会还原系统代理；若异常退出导致无法上网，双击
+  `~/Library/Application Support/TokenMon/restore_system_proxy.command` 即可一键还原。
+- **已知限制**：环境变量注入仅 Windows 有效（macOS 系统代理已覆盖浏览器 / Electron 等
+  GUI 程序；命令行程序如需直采，请手动 `export HTTPS_PROXY=http://127.0.0.1:8898`）。
 
 ## 详细文档
 
@@ -74,3 +87,8 @@ build.bat                     # 打包为单文件 exe
 ## 许可
 
 个人与企业均可免费使用。
+
+## 致谢
+
+感谢原作者 [aa309888654-lang](https://github.com/aa309888654-lang) 提供这套
+优秀的 token 监控工具；本仓库在其基础上补充了 macOS 支持，Windows 版逻辑保持不变。
