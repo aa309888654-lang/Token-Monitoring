@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="LOGO222.png" width="120" alt="小天 tokens 监控">
+  <a href="https://github.com/aa309888654-lang/Token-Monitoring"><img src="https://raw.githubusercontent.com/aa309888654-lang/Token-Monitoring/main/LOGO222.png" width="120" alt="小天 tokens 监控"></a>
 </p>
 
 <h1 align="center">小天 tokens 监控</h1>
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="shot_main.png" width="800" alt="主界面">
+  <a href="https://github.com/aa309888654-lang/Token-Monitoring/blob/main/shot_main.png"><img src="https://raw.githubusercontent.com/aa309888654-lang/Token-Monitoring/main/shot_main.png" width="800" alt="主界面"></a>
 </p>
 
 ---
